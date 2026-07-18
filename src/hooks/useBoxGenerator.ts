@@ -1,7 +1,13 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { BoxConfig, PanelData, Path, Point } from '../types';
-import { processImage, processSvg, removeSmallComponents } from '../lib/imageProcessing';
+import { decodeImageToGray, decodeSvgToGray, applyThreshold, removeSmallComponents, DecodedImage } from '../lib/imageProcessing';
 import type { WorkerResponse } from '../workers/boxWorker';
+
+// Defer heavy synchronous work by one frame so React can paint the
+// "computing…" indicator first, instead of freezing with no feedback.
+function runAfterPaint(fn: () => void) {
+  requestAnimationFrame(() => requestAnimationFrame(fn));
+}
 
 // ── Demo silhouette (used when no image is loaded) ─────────────────────────
 
@@ -53,7 +59,11 @@ export function useBoxGenerator() {
 
   const [imageSrc,  setImageSrc]  = useState<string | null>(null);
   const [svgText,   setSvgText]   = useState<string | null>(null);
-  // rawBinaryData: output of processImage, before dot-filter (kept as ref to avoid re-renders)
+  // Cached decode (grayscale + alpha) of the current source image/SVG.
+  // Decoding is the expensive step — cache it so threshold/invert/bypassThreshold
+  // changes only re-run a cheap single-pass re-scan instead of a full re-decode.
+  const decodedRef = useRef<DecodedImage | null>(null);
+  // rawBinaryData: output of applyThreshold, before dot-filter (kept as ref to avoid re-renders)
   const rawBinaryRef = useRef<Uint8ClampedArray | null>(null);
   // binaryData: after dot-filter, shown in FullscreenEditor
   const [binaryData, setBinaryData] = useState<Uint8ClampedArray | null>(null);
@@ -147,31 +157,7 @@ export function useBoxGenerator() {
     }, 200);
   }, []); // stable — all state accessed via refs
 
-  // ── Image → rawBinaryData ────────────────────────────────────────────────
-
-  useEffect(() => {
-    if (!imageSrc) return;
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.onload = () => {
-      const raw = processImage(img, configRef.current);
-      rawBinaryRef.current = raw;
-      applyDotFilter(raw);
-    };
-    img.src = imageSrc;
-  // Re-run when image source or threshold-related settings change
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [imageSrc, config.threshold, config.bypassThreshold, config.invert]);
-
-  useEffect(() => {
-    if (!svgText) return;
-    processSvg(svgText, configRef.current).then(raw => {
-      rawBinaryRef.current = raw;
-      applyDotFilter(raw);
-    }).catch(console.error);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [svgText, config.threshold, config.bypassThreshold, config.invert]);
-
+  // ── Image/SVG → cached decode → rawBinaryData ────────────────────────────
   // Dot-size filter (runs on main thread — fast, just BFS over pixels)
   // Stable: uses refs for config, stable dispatchGenerate
   const applyDotFilter = useCallback((raw: Uint8ClampedArray) => {
@@ -183,16 +169,72 @@ export function useBoxGenerator() {
     dispatchGenerate(filtered);
   }, [dispatchGenerate]); // dispatchGenerate is stable
 
+  // Cheap step: re-threshold the cached decode. Safe to call on every
+  // threshold/invert/bypassThreshold/minDotSize/dotFilterColor change.
+  const applyThresholdAndDispatch = useCallback(() => {
+    const decoded = decodedRef.current;
+    if (!decoded) return;
+    const raw = applyThreshold(decoded, configRef.current);
+    rawBinaryRef.current = raw;
+    applyDotFilter(raw);
+  }, [applyDotFilter]);
+
+  // Heavy step: decode the source image once per image / rasterResolution change.
+  useEffect(() => {
+    if (!imageSrc) return;
+    setComputing(true);
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      // Defer the heavy decode+convert loop to the next frame so the
+      // "computing…" indicator has a chance to paint first.
+      runAfterPaint(() => {
+        decodedRef.current = decodeImageToGray(img, configRef.current.rasterResolution ?? 1024);
+        applyThresholdAndDispatch();
+      });
+    };
+    img.onerror = () => setComputing(false);
+    img.src = imageSrc;
+  // Re-decode only when the source image or raster resolution changes
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [imageSrc, config.rasterResolution]);
+
+  useEffect(() => {
+    if (!svgText) return;
+    setComputing(true);
+    decodeSvgToGray(svgText, configRef.current.rasterResolution ?? 1024)
+      .then(decoded => {
+        runAfterPaint(() => {
+          decodedRef.current = decoded;
+          applyThresholdAndDispatch();
+        });
+      })
+      .catch(err => { console.error(err); setComputing(false); });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [svgText, config.rasterResolution]);
+
+  // Cheap re-threshold when threshold/invert/bypassThreshold changes — reuses
+  // the cached decode instead of re-decoding the whole image from scratch.
+  useEffect(() => {
+    if (!decodedRef.current) return;
+    setComputing(true);
+    runAfterPaint(applyThresholdAndDispatch);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [config.threshold, config.bypassThreshold, config.invert]);
+
   // Re-apply dot filter when minDotSize / color changes (no image reload)
   useEffect(() => {
     const raw = rawBinaryRef.current;
     if (!raw) return;
-    const { minDotSize, dotFilterColor } = configRef.current;
-    const filtered = minDotSize > 0
-      ? removeSmallComponents(raw, minDotSize, dotFilterColor)
-      : raw;
-    setBinaryData(filtered);
-    dispatchGenerate(filtered);
+    setComputing(true);
+    runAfterPaint(() => {
+      const { minDotSize, dotFilterColor } = configRef.current;
+      const filtered = minDotSize > 0
+        ? removeSmallComponents(raw, minDotSize, dotFilterColor)
+        : raw;
+      setBinaryData(filtered);
+      dispatchGenerate(filtered);
+    });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [config.minDotSize, config.dotFilterColor]);
 

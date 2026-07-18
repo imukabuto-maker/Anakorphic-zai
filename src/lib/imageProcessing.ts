@@ -1,8 +1,22 @@
 import { BoxConfig } from '../types';
 
-export function processImage(img: HTMLImageElement, config: BoxConfig): Uint8ClampedArray {
+/**
+ * Cached, pre-decoded grayscale + alpha representation of a source image.
+ * Decoding (drawImage + getImageData + RGB→gray conversion) is the expensive
+ * part of image processing — it only needs to happen once per source image
+ * (or when rasterResolution changes). Threshold/invert/bypassThreshold only
+ * need a cheap single-pass re-scan of this cached data, not a full re-decode.
+ */
+export interface DecodedImage {
+  gray: Uint8ClampedArray;
+  alpha: Uint8Array;
+  width: number;
+  height: number;
+}
+
+/** Heavy step: decode + downscale + grayscale-convert an image once. */
+export function decodeImageToGray(img: HTMLImageElement, maxDim: number): DecodedImage {
   const canvas = document.createElement('canvas');
-  const maxDim = config.rasterResolution ?? 1024;
   let w = img.width;
   let h = img.height;
   if (w > maxDim || h > maxDim) {
@@ -24,46 +38,46 @@ export function processImage(img: HTMLImageElement, config: BoxConfig): Uint8Cla
   ctx.drawImage(img, 0, 0, w, h);
   const imgData = ctx.getImageData(0, 0, w, h);
   const data = imgData.data;
+  const total = w * h;
 
-  const binaryData = new Uint8ClampedArray(w * h);
+  const gray  = new Uint8ClampedArray(total);
+  const alpha = new Uint8Array(total);
 
-  for (let i = 0; i < data.length; i += 4) {
-    const a = data[i + 3];
-    const idx = i / 4;
+  for (let i = 0, idx = 0; i < data.length; i += 4, idx++) {
+    alpha[idx] = data[i + 3];
+    gray[idx]  = (0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]) | 0;
+  }
 
+  return { gray, alpha, width: w, height: h };
+}
+
+/** Cheap step: threshold/invert a cached decode. Safe to re-run on every slider change. */
+export function applyThreshold(decoded: DecodedImage, config: BoxConfig): Uint8ClampedArray {
+  const { gray, alpha, width, height } = decoded;
+  const total = width * height;
+  const binaryData = new Uint8ClampedArray(total);
+
+  // bypassThreshold: image is already a silhouette — skip dynamic threshold,
+  // use a fixed gray < 128 cutoff so no extra processing distorts the shape.
+  const cutoff = config.bypassThreshold ? 128 : config.threshold;
+  const invert = config.invert;
+
+  for (let idx = 0; idx < total; idx++) {
     // Transparent pixels are always background regardless of invert
-    if (a < 128) {
-      binaryData[idx] = 0;
-      continue;
-    }
-
-    const r = data[i];
-    const g = data[i + 1];
-    const b = data[i + 2];
-    const gray = 0.299 * r + 0.587 * g + 0.114 * b;
-
-    // bypassThreshold: image is already a silhouette — skip dynamic threshold,
-    // use a fixed gray < 128 cutoff so no extra processing distorts the shape.
-    const cutoff = config.bypassThreshold ? 128 : config.threshold;
-    let isForeground = gray < cutoff;
-    if (config.invert) isForeground = !isForeground;
-
+    if (alpha[idx] < 128) { binaryData[idx] = 0; continue; }
+    let isForeground = gray[idx] < cutoff;
+    if (invert) isForeground = !isForeground;
     binaryData[idx] = isForeground ? 255 : 0;
   }
 
-  (binaryData as any).width = w;
-  (binaryData as any).height = h;
-
+  (binaryData as any).width  = width;
+  (binaryData as any).height = height;
   return binaryData;
 }
 
-/**
- * Rasterize an SVG string into a binaryData array.
- */
-export async function processSvg(svgText: string, config: BoxConfig): Promise<Uint8ClampedArray> {
+/** Heavy step: rasterize + decode an SVG string into cached grayscale + alpha, once. */
+export async function decodeSvgToGray(svgText: string, maxDim: number): Promise<DecodedImage> {
   return new Promise((resolve, reject) => {
-    const maxDim = config.rasterResolution ?? 1024;
-
     const blob = new Blob([svgText], { type: 'image/svg+xml' });
     const url = URL.createObjectURL(blob);
 
@@ -93,31 +107,17 @@ export async function processSvg(svgText: string, config: BoxConfig): Promise<Ui
 
       const imgData = ctx.getImageData(0, 0, w, h);
       const data = imgData.data;
-      const binaryData = new Uint8ClampedArray(w * h);
+      const total = w * h;
 
-      for (let i = 0; i < data.length; i += 4) {
-        const a = data[i + 3];
-        const idx = i / 4;
+      const gray  = new Uint8ClampedArray(total);
+      const alpha = new Uint8Array(total);
 
-        if (a < 128) {
-          binaryData[idx] = 0;
-          continue;
-        }
-
-        const r = data[i];
-        const g = data[i + 1];
-        const b = data[i + 2];
-        const gray = 0.299 * r + 0.587 * g + 0.114 * b;
-        const cutoff = config.bypassThreshold ? 128 : config.threshold;
-        let isForeground = gray < cutoff;
-        if (config.invert) isForeground = !isForeground;
-
-        binaryData[idx] = isForeground ? 255 : 0;
+      for (let i = 0, idx = 0; i < data.length; i += 4, idx++) {
+        alpha[idx] = data[i + 3];
+        gray[idx]  = (0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]) | 0;
       }
 
-      (binaryData as any).width = w;
-      (binaryData as any).height = h;
-      resolve(binaryData);
+      resolve({ gray, alpha, width: w, height: h });
     };
 
     img.onerror = () => {

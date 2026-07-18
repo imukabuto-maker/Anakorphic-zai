@@ -439,7 +439,18 @@ function WallSimulationImpl({ contours, panels, config }: WallSimulationProps) {
 
     s.resize();
     s.draw();
-  }, [panels, contours, config]);
+  // Only rebuild the (expensive) 3D geometry when panels/contours change, or
+  // when a field this effect actually reads changes — not on every config
+  // update (e.g. threshold, minDotSize don't affect this scene directly and
+  // are already reflected via `panels` once the worker finishes).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    panels, contours,
+    config.width, config.height, config.depth, config.materialThickness,
+    config.ledX, config.ledY, config.ledZ,
+    config.shadowScale, config.shadowRotation,
+    config.silhouetteOffsetX, config.silhouetteOffsetY,
+  ]);
 
   const handleReset = () => {
     const s = sceneRef.current;
